@@ -391,7 +391,7 @@ impl std::error::Error for Bip34Error {
 }
 
 /// A block validation error.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationError {
     /// The header hash is not below the target.
     BadProofOfWork,
@@ -423,7 +423,7 @@ impl std::error::Error for ValidationError {
 
 #[cfg(test)]
 mod tests {
-    use hashes::hex::FromHex;
+    use hex::FromHex;
 
     use super::*;
     use crate::consensus::encode::{deserialize, serialize};

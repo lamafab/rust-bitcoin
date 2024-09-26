@@ -3,8 +3,8 @@
 #[allow(unused_macros)]
 macro_rules! hex_psbt {
     ($s:expr) => {
-        <$crate::psbt::PartiallySignedTransaction>::deserialize(
-            &<$crate::prelude::Vec<u8> as $crate::hashes::hex::FromHex>::from_hex($s).unwrap(),
+        <$crate::psbt::Psbt>::deserialize(
+            &<$crate::prelude::Vec<u8> as $crate::hex::FromHex>::from_hex($s).unwrap(),
         )
     };
 }

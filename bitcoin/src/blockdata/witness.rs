@@ -6,6 +6,7 @@
 //!
 
 use core::convert::TryInto;
+use core::fmt;
 use core::ops::Index;
 
 use secp256k1::ecdsa;
@@ -28,7 +29,7 @@ use crate::{Script, VarInt};
 /// saving some allocations.
 ///
 /// [segwit upgrade]: <https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki>
-#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Witness {
     /// Contains the witness `Vec<Vec<u8>>` serialization without the initial varint indicating the
     /// number of elements (which is stored in `witness_elements`).
@@ -43,6 +44,68 @@ pub struct Witness {
     /// This is the valid index pointing to the beginning of the index area. This area is 4 *
     /// stack_size bytes at the end of the content vector which stores the indices of each item.
     indices_start: usize,
+}
+
+impl fmt::Debug for Witness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        if f.alternate() {
+            fmt_debug_pretty(self, f)
+        } else {
+            fmt_debug(self, f)
+        }
+    }
+}
+
+fn fmt_debug(w: &Witness, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+    #[rustfmt::skip]
+    let comma_or_close = |current_index, last_index| {
+        if current_index == last_index { "]" } else { ", " }
+    };
+
+    f.write_str("Witness: { ")?;
+    write!(f, "indices: {}, ", w.witness_elements)?;
+    write!(f, "indices_start: {}, ", w.indices_start)?;
+    f.write_str("witnesses: [")?;
+
+    let instructions = w.iter();
+    let last_instruction = instructions.len() - 1;
+
+    for (i, instruction) in instructions.enumerate() {
+        let bytes = instruction.iter();
+        let last_byte = bytes.len() - 1;
+
+        f.write_str("[")?;
+
+        for (j, byte) in bytes.enumerate() {
+            write!(f, "{:#04x}", byte)?;
+            f.write_str(comma_or_close(j, last_byte))?;
+        }
+
+        f.write_str(comma_or_close(i, last_instruction))?;
+    }
+
+    f.write_str(" }")
+}
+
+fn fmt_debug_pretty(w: &Witness, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+    f.write_str("Witness: {\n")?;
+    writeln!(f, "    indices: {},", w.witness_elements)?;
+    writeln!(f, "    indices_start: {},", w.indices_start)?;
+    f.write_str("    witnesses: [\n")?;
+
+    for instruction in w.iter() {
+        f.write_str("        [")?;
+        for (j, byte) in instruction.iter().enumerate() {
+            if j > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{:#04x}", byte)?;
+        }
+        f.write_str("],\n")?;
+    }
+
+    writeln!(f, "    ],")?;
+    writeln!(f, "}}")
 }
 
 /// An iterator returning individual witness elements.
@@ -163,10 +226,6 @@ impl Encodable for Witness {
 impl Witness {
     /// Creates a new empty [`Witness`].
     pub fn new() -> Self { Witness::default() }
-
-    /// Creates [`Witness`] object from an array of byte-arrays
-    #[deprecated(since = "0.30.0", note = "use `Witness::from_slice()` instead")]
-    pub fn from_vec(vec: Vec<Vec<u8>>) -> Self { Witness::from_slice(&vec) }
 
     /// Creates a [`Witness`] object from a slice of bytes slices where each slice is a witness item.
     pub fn from_slice<T: AsRef<[u8]>>(slice: &[T]) -> Self {
@@ -399,8 +458,8 @@ impl<'de> serde::Deserialize<'de> for Witness {
                 self,
                 mut a: A,
             ) -> Result<Self::Value, A::Error> {
-                use hashes::hex::Error::*;
-                use hashes::hex::FromHex;
+                use hex::FromHex;
+                use hex::HexToBytesError::*;
                 use serde::de::{self, Unexpected};
 
                 let mut ret = match a.size_hint() {
@@ -422,10 +481,6 @@ impl<'de> serde::Deserialize<'de> for Witness {
                         },
                         OddLengthString(len) =>
                             de::Error::invalid_length(len, &"an even length string"),
-                        InvalidLength(expected, got) => {
-                            let exp = format!("expected length: {}", expected);
-                            de::Error::invalid_length(got, &exp.as_str())
-                        }
                     })?;
                     ret.push(vec);
                 }

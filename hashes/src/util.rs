@@ -127,7 +127,7 @@ macro_rules! engine_input_impl(
 /// You can add arbitrary doc comments or other attributes to the struct or it's field. Note that
 /// the macro already derives [`Copy`], [`Clone`], [`Eq`], [`PartialEq`],
 /// [`Hash`](core::hash::Hash), [`Ord`], [`PartialOrd`]. With the `serde` feature on, this also adds
-/// [`Serialize`](serde::Serialize) and [`Deserialize](serde::Deserialize) implementations.
+/// `Serialize` and `Deserialize` implementations.
 ///
 /// You can also define multiple newtypes within one macro call:
 ///
@@ -268,15 +268,15 @@ macro_rules! hash_newtype {
         }
 
         impl $crate::_export::_core::str::FromStr for $newtype {
-            type Err = $crate::hex::Error;
+            type Err = $crate::hex::HexToArrayError;
             fn from_str(s: &str) -> $crate::_export::_core::result::Result<$newtype, Self::Err> {
-                use $crate::hex::{HexIterator, FromHex};
+                use $crate::hex::{FromHex, HexToBytesIter};
                 use $crate::Hash;
 
                 let inner: <$hash as Hash>::Bytes = if <Self as $crate::Hash>::DISPLAY_BACKWARD {
-                    FromHex::from_byte_iter(HexIterator::new(s)?.rev())?
+                    FromHex::from_byte_iter(HexToBytesIter::new(s)?.rev())?
                 } else {
-                    FromHex::from_byte_iter(HexIterator::new(s)?)?
+                    FromHex::from_byte_iter(HexToBytesIter::new(s)?)?
                 };
                 Ok($newtype(<$hash>::from_byte_array(inner)))
             }

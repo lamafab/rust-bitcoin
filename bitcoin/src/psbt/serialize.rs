@@ -12,7 +12,6 @@ use hashes::{hash160, ripemd160, sha256, sha256d, Hash};
 use secp256k1::{self, XOnlyPublicKey};
 
 use super::map::{Input, Map, Output, PsbtSighashType};
-use super::Psbt;
 use crate::bip32::{ChildNumber, Fingerprint, KeySource};
 use crate::blockdata::script::ScriptBuf;
 use crate::blockdata::transaction::{Transaction, TxOut};
@@ -21,7 +20,7 @@ use crate::consensus::encode::{self, deserialize_partial, serialize, Decodable, 
 use crate::crypto::key::PublicKey;
 use crate::crypto::{ecdsa, taproot};
 use crate::prelude::*;
-use crate::psbt::{Error, PartiallySignedTransaction};
+use crate::psbt::{Error, Psbt};
 use crate::taproot::{
     ControlBlock, LeafVersion, TapLeafHash, TapNodeHash, TapTree, TaprootBuilder,
 };
@@ -39,7 +38,7 @@ pub(crate) trait Deserialize: Sized {
     fn deserialize(bytes: &[u8]) -> Result<Self, Error>;
 }
 
-impl PartiallySignedTransaction {
+impl Psbt {
     /// Serialize a value as bytes in hex.
     pub fn serialize_hex(&self) -> String { self.serialize().to_lower_hex_string() }
 
@@ -177,11 +176,9 @@ impl Deserialize for ecdsa::Signature {
         // would use check the signature assuming sighash_u32 as `0x01`.
         ecdsa::Signature::from_slice(bytes).map_err(|e| match e {
             ecdsa::Error::EmptySignature => Error::InvalidEcdsaSignature(e),
-            ecdsa::Error::NonStandardSighashType(flag) => Error::NonStandardSighashType(flag),
+            ecdsa::Error::SighashType(err) => Error::NonStandardSighashType(err.0),
             ecdsa::Error::Secp256k1(..) => Error::InvalidEcdsaSignature(e),
-            ecdsa::Error::HexEncoding(..) => {
-                unreachable!("Decoding from slice, not hex")
-            }
+            ecdsa::Error::Hex(..) => unreachable!("Decoding from slice, not hex"),
         })
     }
 }
@@ -261,7 +258,7 @@ impl Deserialize for taproot::Signature {
         use taproot::SigFromSliceError::*;
 
         taproot::Signature::from_slice(bytes).map_err(|e| match e {
-            InvalidSighashType(flag) => Error::NonStandardSighashType(flag as u32),
+            SighashType(err) => Error::NonStandardSighashType(err.0),
             InvalidSignatureSize(_) => Error::InvalidTaprootSignature(e),
             Secp256k1(..) => Error::InvalidTaprootSignature(e),
         })
@@ -451,6 +448,6 @@ mod tests {
     #[should_panic(expected = "InvalidMagic")]
     fn invalid_vector_1() {
         let hex_psbt = b"0200000001268171371edff285e937adeea4b37b78000c0566cbb3ad64641713ca42171bf6000000006a473044022070b2245123e6bf474d60c5b50c043d4c691a5d2435f09a34a7662a9dc251790a022001329ca9dacf280bdf30740ec0390422422c81cb45839457aeb76fc12edd95b3012102657d118d3357b8e0f4c2cd46db7b39f6d9c38d9a70abcb9b2de5dc8dbfe4ce31feffffff02d3dff505000000001976a914d0c59903c5bac2868760e90fd521a4665aa7652088ac00e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787b32e1300";
-        PartiallySignedTransaction::deserialize(hex_psbt).unwrap();
+        Psbt::deserialize(hex_psbt).unwrap();
     }
 }

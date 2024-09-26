@@ -19,15 +19,13 @@ use hashes::{self, sha256d, Hash};
 use internals::write_err;
 
 use super::Weight;
-use crate::blockdata::constants::WITNESS_SCALE_FACTOR;
 use crate::blockdata::locktime::absolute::{self, Height, Time};
 use crate::blockdata::locktime::relative;
-#[cfg(feature = "bitcoinconsensus")]
-use crate::blockdata::script;
-use crate::blockdata::script::{Script, ScriptBuf};
+use crate::blockdata::script::ScriptBuf;
 use crate::blockdata::witness::Witness;
+#[cfg(feature = "bitcoinconsensus")]
+pub use crate::consensus::validation::TxVerifyError;
 use crate::consensus::{encode, Decodable, Encodable};
-use crate::crypto::sighash::LegacySighash;
 use crate::hash_types::{Txid, Wtxid};
 use crate::internal_macros::impl_consensus_encoding;
 use crate::parse::impl_parse_str_from_int_infallible;
@@ -69,7 +67,7 @@ impl OutPoint {
     ///
     /// ```rust
     /// use bitcoin::constants::genesis_block;
-    /// use bitcoin::network::constants::Network;
+    /// use bitcoin::Network;
     ///
     /// let block = genesis_block(Network::Bitcoin);
     /// let tx = &block.txdata[0];
@@ -92,11 +90,11 @@ impl fmt::Display for OutPoint {
 }
 
 /// An error in parsing an OutPoint.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ParseOutPointError {
     /// Error in TXID part.
-    Txid(hashes::hex::Error),
+    Txid(hex::HexToArrayError),
     /// Error in vout part.
     Vout(crate::error::ParseIntError),
     /// Error in general format.
@@ -221,12 +219,13 @@ impl TxIn {
     /// Keep in mind that when adding a TxIn to a transaction, the total weight of the transaction
     /// might increase more than `TxIn::legacy_weight`. This happens when the new input added causes
     /// the input length `VarInt` to increase its encoding length.
-    pub fn legacy_weight(&self) -> usize {
+    pub fn legacy_weight(&self) -> Weight {
         let script_sig_size = self.script_sig.len();
         // Size in vbytes:
         // previous_output (36) + script_sig varint len + script_sig push + sequence (4)
-        // We then multiply by 4 to convert to WU
-        (36 + VarInt(script_sig_size as u64).len() + script_sig_size + 4) * 4
+        Weight::from_non_witness_data_size(
+            (36 + VarInt(script_sig_size as u64).len() + script_sig_size + 4) as u64,
+        )
     }
 
     /// The weight of the TxIn when it's included in a segwit transaction (i.e., a transaction
@@ -240,7 +239,9 @@ impl TxIn {
     /// - the new input added causes the input length `VarInt` to increase its encoding length
     /// - the new input is the first segwit input added - this will add an additional 2WU to the
     ///   transaction weight to take into account the segwit marker
-    pub fn segwit_weight(&self) -> usize { self.legacy_weight() + self.witness.serialized_len() }
+    pub fn segwit_weight(&self) -> Weight {
+        self.legacy_weight() + Weight::from_witness_data_size(self.witness.serialized_len() as u64)
+    }
 }
 
 impl Default for TxIn {
@@ -493,12 +494,13 @@ impl TxOut {
     /// Keep in mind that when adding a TxOut to a transaction, the total weight of the transaction
     /// might increase more than `TxOut::weight`. This happens when the new output added causes
     /// the output length `VarInt` to increase its encoding length.
-    pub fn weight(&self) -> usize {
+    pub fn weight(&self) -> Weight {
         let script_len = self.script_pubkey.len();
         // In vbytes:
         // value (8) + script varint len + script push
-        // Then we multiply by 4 to convert to WU
-        (8 + VarInt(script_len as u64).len() + script_len) * 4
+        Weight::from_non_witness_data_size(
+            (8 + VarInt(script_len as u64).len() + script_len) as u64,
+        )
     }
 
     /// Creates a `TxOut` with given script and the smallest possible `value` that is **not** dust
@@ -518,75 +520,6 @@ impl TxOut {
         TxOut {
             value: Amount::from_sat(dust_amount + 1), // minimal non-dust amount is one higher than dust amount
             script_pubkey,
-        }
-    }
-}
-
-/// Result of [`Transaction::encode_signing_data_to`].
-///
-/// This type forces the caller to handle SIGHASH_SINGLE bug case.
-///
-/// This corner case can't be expressed using standard `Result`,
-/// in a way that is both convenient and not-prone to accidental
-/// mistakes (like calling `.expect("writer never fails")`).
-#[must_use]
-pub enum EncodeSigningDataResult<E> {
-    /// Input data is an instance of `SIGHASH_SINGLE` bug
-    SighashSingleBug,
-    /// Operation performed normally.
-    WriteResult(Result<(), E>),
-}
-
-impl<E> EncodeSigningDataResult<E> {
-    /// Checks for SIGHASH_SINGLE bug returning error if the writer failed.
-    ///
-    /// This method is provided for easy and correct handling of the result because
-    /// SIGHASH_SINGLE bug is a special case that must not be ignored nor cause panicking.
-    /// Since the data is usually written directly into a hasher which never fails,
-    /// the recommended pattern to handle this is:
-    ///
-    /// ```rust
-    /// # use bitcoin::consensus::deserialize;
-    /// # use bitcoin::hashes::{Hash, hex::FromHex};
-    /// # use bitcoin::sighash::{LegacySighash, SighashCache};
-    /// # use bitcoin::Transaction;
-    /// # let mut writer = LegacySighash::engine();
-    /// # let input_index = 0;
-    /// # let script_pubkey = bitcoin::ScriptBuf::new();
-    /// # let sighash_u32 = 0u32;
-    /// # const SOME_TX: &'static str = "0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000";
-    /// # let raw_tx = Vec::from_hex(SOME_TX).unwrap();
-    /// # let tx: Transaction = deserialize(&raw_tx).unwrap();
-    /// let cache = SighashCache::new(&tx);
-    /// if cache.legacy_encode_signing_data_to(&mut writer, input_index, &script_pubkey, sighash_u32)
-    ///         .is_sighash_single_bug()
-    ///         .expect("writer can't fail") {
-    ///     // use a hash value of "1", instead of computing the actual hash due to SIGHASH_SINGLE bug
-    /// }
-    /// ```
-    #[allow(clippy::wrong_self_convention)] // E is not Copy so we consume self.
-    pub fn is_sighash_single_bug(self) -> Result<bool, E> {
-        match self {
-            EncodeSigningDataResult::SighashSingleBug => Ok(true),
-            EncodeSigningDataResult::WriteResult(Ok(())) => Ok(false),
-            EncodeSigningDataResult::WriteResult(Err(e)) => Err(e),
-        }
-    }
-
-    /// Maps a `Result<T, E>` to `Result<T, F>` by applying a function to a
-    /// contained [`Err`] value, leaving an [`Ok`] value untouched.
-    ///
-    /// Like [`Result::map_err`].
-    pub fn map_err<E2, F>(self, f: F) -> EncodeSigningDataResult<E2>
-    where
-        F: FnOnce(E) -> E2,
-    {
-        match self {
-            EncodeSigningDataResult::SighashSingleBug => EncodeSigningDataResult::SighashSingleBug,
-            EncodeSigningDataResult::WriteResult(Err(e)) =>
-                EncodeSigningDataResult::WriteResult(Err(f(e))),
-            EncodeSigningDataResult::WriteResult(Ok(o)) =>
-                EncodeSigningDataResult::WriteResult(Ok(o)),
         }
     }
 }
@@ -679,6 +612,10 @@ impl cmp::Ord for Transaction {
 }
 
 impl Transaction {
+    /// Maximum transaction weight for Bitcoin Core 25.0.
+    // https://github.com/bitcoin/bitcoin/blob/44b05bf3fef2468783dcebf651654fdd30717e7e/src/policy/policy.h#L27
+    pub const MAX_STANDARD_WEIGHT: Weight = Weight::from_wu(400_000);
+
     /// Computes a "normalized TXID" which does not include any signatures.
     ///
     /// This gives a way to identify a transaction that is "the same" as
@@ -726,101 +663,6 @@ impl Transaction {
         Wtxid::from_engine(enc)
     }
 
-    /// Encodes the signing data from which a signature hash for a given input index with a given
-    /// sighash flag can be computed.
-    ///
-    /// To actually produce a scriptSig, this hash needs to be run through an ECDSA signer, the
-    /// [`EcdsaSighashType`] appended to the resulting sig, and a script written around this, but
-    /// this is the general (and hard) part.
-    ///
-    /// The `sighash_type` supports an arbitrary `u32` value, instead of just [`EcdsaSighashType`],
-    /// because internally 4 bytes are being hashed, even though only the lowest byte is appended to
-    /// signature in a transaction.
-    ///
-    /// # Warning
-    ///
-    /// - Does NOT attempt to support OP_CODESEPARATOR. In general this would require evaluating
-    /// `script_pubkey` to determine which separators get evaluated and which don't, which we don't
-    /// have the information to determine.
-    /// - Does NOT handle the sighash single bug (see "Returns" section)
-    ///
-    /// # Returns
-    ///
-    /// This function can't handle the SIGHASH_SINGLE bug internally, so it returns [`EncodeSigningDataResult`]
-    /// that must be handled by the caller (see [`EncodeSigningDataResult::is_sighash_single_bug`]).
-    ///
-    /// # Panics
-    ///
-    /// If `input_index` is out of bounds (greater than or equal to `self.input.len()`).
-    #[deprecated(
-        since = "0.30.0",
-        note = "Use SighashCache::legacy_encode_signing_data_to instead"
-    )]
-    pub fn encode_signing_data_to<Write: io::Write, U: Into<u32>>(
-        &self,
-        writer: Write,
-        input_index: usize,
-        script_pubkey: &Script,
-        sighash_type: U,
-    ) -> EncodeSigningDataResult<io::Error> {
-        use EncodeSigningDataResult::*;
-
-        use crate::sighash::{self, SighashCache};
-
-        assert!(input_index < self.input.len()); // Panic on OOB
-
-        let cache = SighashCache::new(self);
-        match cache.legacy_encode_signing_data_to(writer, input_index, script_pubkey, sighash_type)
-        {
-            SighashSingleBug => SighashSingleBug,
-            WriteResult(res) => match res {
-                Ok(()) => WriteResult(Ok(())),
-                Err(e) => match e {
-                    sighash::Error::Io(e) => WriteResult(Err(e.into())),
-                    _ => unreachable!("we check input_index above"),
-                },
-            },
-        }
-    }
-
-    /// Computes a signature hash for a given input index with a given sighash flag.
-    ///
-    /// To actually produce a scriptSig, this hash needs to be run through an ECDSA signer, the
-    /// [`EcdsaSighashType`] appended to the resulting sig, and a script written around this, but
-    /// this is the general (and hard) part.
-    ///
-    /// The `sighash_type` supports an arbitrary `u32` value, instead of just [`EcdsaSighashType`],
-    /// because internally 4 bytes are being hashed, even though only the lowest byte is appended to
-    /// signature in a transaction.
-    ///
-    /// This function correctly handles the sighash single bug by returning the 'one array'. The
-    /// sighash single bug becomes exploitable when one tries to sign a transaction with
-    /// `SIGHASH_SINGLE` and there is not a corresponding output with the same index as the input.
-    ///
-    /// # Warning
-    ///
-    /// Does NOT attempt to support OP_CODESEPARATOR. In general this would require evaluating
-    /// `script_pubkey` to determine which separators get evaluated and which don't, which we don't
-    /// have the information to determine.
-    ///
-    /// # Panics
-    ///
-    /// If `input_index` is out of bounds (greater than or equal to `self.input.len()`).
-    #[deprecated(since = "0.30.0", note = "Use SighashCache::legacy_signature_hash instead")]
-    pub fn signature_hash(
-        &self,
-        input_index: usize,
-        script_pubkey: &Script,
-        sighash_u32: u32,
-    ) -> LegacySighash {
-        assert!(input_index < self.input.len()); // Panic on OOB, enables expect below.
-
-        let cache = crate::sighash::SighashCache::new(self);
-        cache
-            .legacy_signature_hash(input_index, script_pubkey, sighash_u32)
-            .expect("cache method doesn't error")
-    }
-
     /// Returns the "weight" of this transaction, as defined by BIP141.
     ///
     /// For transactions with an empty witness, this is simply the consensus-serialized size times
@@ -838,17 +680,6 @@ impl Transaction {
     /// and can therefore avoid this ambiguity.
     #[inline]
     pub fn weight(&self) -> Weight {
-        Weight::from_wu(self.scaled_size(WITNESS_SCALE_FACTOR) as u64)
-    }
-
-    /// Returns the regular byte-wise consensus-serialized size of this transaction.
-    #[inline]
-    pub fn size(&self) -> usize { self.scaled_size(1) }
-
-    /// Computes the weight and checks that it matches the output of `predict_weight`.
-    #[cfg(test)]
-    fn check_weight(&self) -> Weight {
-        let weight1 = self.weight();
         let inputs = self.input.iter().map(|txin| {
             InputWeightPrediction::new(
                 txin.script_sig.len(),
@@ -856,10 +687,12 @@ impl Transaction {
             )
         });
         let outputs = self.output.iter().map(|txout| txout.script_pubkey.len());
-        let weight2 = predict_weight(inputs, outputs);
-        assert_eq!(weight1, weight2);
-        weight1
+        predict_weight(inputs, outputs)
     }
+
+    /// Returns the regular byte-wise consensus-serialized size of this transaction.
+    #[inline]
+    pub fn size(&self) -> usize { self.scaled_size(1) }
 
     /// Returns the "virtual size" (vsize) of this transaction.
     ///
@@ -939,36 +772,6 @@ impl Transaction {
         }
     }
 
-    /// Shorthand for [`Self::verify_with_flags`] with flag [`bitcoinconsensus::VERIFY_ALL`].
-    #[cfg(feature = "bitcoinconsensus")]
-    pub fn verify<S>(&self, spent: S) -> Result<(), script::Error>
-    where
-        S: FnMut(&OutPoint) -> Option<TxOut>,
-    {
-        self.verify_with_flags(spent, bitcoinconsensus::VERIFY_ALL)
-    }
-
-    /// Verify that this transaction is able to spend its inputs.
-    ///
-    /// The `spent` closure should not return the same [`TxOut`] twice!
-    #[cfg(feature = "bitcoinconsensus")]
-    pub fn verify_with_flags<S, F>(&self, mut spent: S, flags: F) -> Result<(), script::Error>
-    where
-        S: FnMut(&OutPoint) -> Option<TxOut>,
-        F: Into<u32>,
-    {
-        let tx = encode::serialize(self);
-        let flags: u32 = flags.into();
-        for (idx, input) in self.input.iter().enumerate() {
-            if let Some(output) = spent(&input.previous_output) {
-                output.script_pubkey.verify_with_flags(idx, output.value, tx.as_slice(), flags)?;
-            } else {
-                return Err(script::Error::UnknownSpentOutput(input.previous_output));
-            }
-        }
-        Ok(())
-    }
-
     /// Checks if this is a coinbase transaction.
     ///
     /// The first transaction in the block distributes the mining reward and is called the coinbase
@@ -981,7 +784,7 @@ impl Transaction {
     }
 
     /// Checks if this is a coinbase transaction.
-    #[deprecated(since = "0.0.0-NEXT-RELEASE", note = "use is_coinbase instead")]
+    #[deprecated(since = "0.31.0", note = "use is_coinbase instead")]
     pub fn is_coin_base(&self) -> bool { self.is_coinbase() }
 
     /// Returns `true` if the transaction itself opted in to be BIP-125-replaceable (RBF).
@@ -1430,7 +1233,7 @@ impl InputWeightPrediction {
 mod tests {
     use core::str::FromStr;
 
-    use hashes::hex::FromHex;
+    use hex::FromHex;
 
     use super::*;
     use crate::blockdata::constants::WITNESS_SCALE_FACTOR;
@@ -1548,7 +1351,7 @@ mod tests {
     #[test]
     fn test_is_coinbase() {
         use crate::blockdata::constants;
-        use crate::network::constants::Network;
+        use crate::network::Network;
 
         let genesis = constants::genesis_block(Network::Bitcoin);
         assert!(genesis.txdata[0].is_coinbase());
@@ -1585,7 +1388,7 @@ mod tests {
             format!("{:x}", realtx.wtxid()),
             "a6eab3c14ab5272a58a5ba91505ba1a4b6d7a3a9fcbd187b6cd99a7b6d548cb7".to_string()
         );
-        assert_eq!(realtx.check_weight().to_wu() as usize, tx_bytes.len() * WITNESS_SCALE_FACTOR);
+        assert_eq!(realtx.weight().to_wu() as usize, tx_bytes.len() * WITNESS_SCALE_FACTOR);
         assert_eq!(realtx.size(), tx_bytes.len());
         assert_eq!(realtx.vsize(), tx_bytes.len());
         assert_eq!(realtx.strippedsize(), tx_bytes.len());
@@ -1626,7 +1429,7 @@ mod tests {
             "80b7d8a82d5d5bf92905b06f2014dd699e03837ca172e3a59d51426ebbe3e7f5".to_string()
         );
         const EXPECTED_WEIGHT: Weight = Weight::from_wu(442);
-        assert_eq!(realtx.check_weight(), EXPECTED_WEIGHT);
+        assert_eq!(realtx.weight(), EXPECTED_WEIGHT);
         assert_eq!(realtx.size(), tx_bytes.len());
         assert_eq!(realtx.vsize(), 111);
         // Since
@@ -1641,7 +1444,7 @@ mod tests {
         let mut tx_without_witness = realtx;
         tx_without_witness.input.iter_mut().for_each(|input| input.witness.clear());
         assert_eq!(
-            tx_without_witness.check_weight().to_wu() as usize,
+            tx_without_witness.weight().to_wu() as usize,
             expected_strippedsize * WITNESS_SCALE_FACTOR
         );
         assert_eq!(tx_without_witness.size(), expected_strippedsize);
@@ -1758,7 +1561,7 @@ mod tests {
             format!("{:x}", tx.txid()),
             "9652aa62b0e748caeec40c4cb7bc17c6792435cc3dfe447dd1ca24f912a1c6ec"
         );
-        assert_eq!(tx.check_weight(), Weight::from_wu(2718));
+        assert_eq!(tx.weight(), Weight::from_wu(2718));
 
         // non-segwit tx from my mempool
         let tx_bytes = hex!(
@@ -1796,7 +1599,7 @@ mod tests {
     fn test_segwit_tx_decode() {
         let tx_bytes = hex!("010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff3603da1b0e00045503bd5704c7dd8a0d0ced13bb5785010800000000000a636b706f6f6c122f4e696e6a61506f6f6c2f5345475749542fffffffff02b4e5a212000000001976a914876fbb82ec05caa6af7a3b5e5a983aae6c6cc6d688ac0000000000000000266a24aa21a9edf91c46b49eb8a29089980f02ee6b57e7d63d33b18b4fddac2bcd7db2a39837040120000000000000000000000000000000000000000000000000000000000000000000000000");
         let tx: Transaction = deserialize(&tx_bytes).unwrap();
-        assert_eq!(tx.check_weight(), Weight::from_wu(780));
+        assert_eq!(tx.weight(), Weight::from_wu(780));
         serde_round_trip!(tx);
 
         let consensus_encoded = serialize(&tx);
@@ -1832,7 +1635,7 @@ mod tests {
         for s in sht_mistakes {
             assert_eq!(
                 EcdsaSighashType::from_str(s).unwrap_err().to_string(),
-                format!("Unrecognized SIGHASH string '{}'", s)
+                format!("unrecognized SIGHASH string '{}'", s)
             );
         }
     }
@@ -1848,7 +1651,6 @@ mod tests {
     fn test_transaction_verify() {
         use std::collections::HashMap;
 
-        use crate::blockdata::script;
         use crate::blockdata::witness::Witness;
 
         // a random recent segwit transaction from blockchain using both old and segwit inputs
@@ -1905,7 +1707,7 @@ mod tests {
             .err()
             .unwrap()
         {
-            script::Error::BitcoinConsensus(_) => {}
+            TxVerifyError::ScriptVerification(_) => {}
             _ => panic!("Wrong error type"),
         }
     }
@@ -1952,20 +1754,20 @@ mod tests {
 
     #[test]
     fn txin_txout_weight_tests() {
-        // [(is_segwit, tx_hex, expected_wu)]
+        // [(is_segwit, tx_hex, expected_weight)]
         let txs = [
                 // one segwit input (P2WPKH)
-                (true, "020000000001018a763b78d3e17acea0625bf9e52b0dc1beb2241b2502185348ba8ff4a253176e0100000000ffffffff0280d725000000000017a914c07ed639bd46bf7087f2ae1dfde63b815a5f8b488767fda20300000000160014869ec8520fa2801c8a01bfdd2e82b19833cd0daf02473044022016243edad96b18c78b545325aaff80131689f681079fb107a67018cb7fb7830e02205520dae761d89728f73f1a7182157f6b5aecf653525855adb7ccb998c8e6143b012103b9489bde92afbcfa85129a82ffa512897105d1a27ad9806bded27e0532fc84e700000000", 565),
+                (true, "020000000001018a763b78d3e17acea0625bf9e52b0dc1beb2241b2502185348ba8ff4a253176e0100000000ffffffff0280d725000000000017a914c07ed639bd46bf7087f2ae1dfde63b815a5f8b488767fda20300000000160014869ec8520fa2801c8a01bfdd2e82b19833cd0daf02473044022016243edad96b18c78b545325aaff80131689f681079fb107a67018cb7fb7830e02205520dae761d89728f73f1a7182157f6b5aecf653525855adb7ccb998c8e6143b012103b9489bde92afbcfa85129a82ffa512897105d1a27ad9806bded27e0532fc84e700000000", Weight::from_wu(565)),
                 // one segwit input (P2WSH)
-                (true, "01000000000101a3ccad197118a2d4975fadc47b90eacfdeaf8268adfdf10ed3b4c3b7e1ad14530300000000ffffffff0200cc5501000000001976a91428ec6f21f4727bff84bb844e9697366feeb69f4d88aca2a5100d00000000220020701a8d401c84fb13e6baf169d59684e17abd9fa216c8cc5b9fc63d622ff8c58d04004730440220548f11130353b3a8f943d2f14260345fc7c20bde91704c9f1cbb5456355078cd0220383ed4ed39b079b618bcb279bbc1f2ca18cb028c4641cb522c9c5868c52a0dc20147304402203c332ecccb3181ca82c0600520ee51fee80d3b4a6ab110945e59475ec71e44ac0220679a11f3ca9993b04ccebda3c834876f353b065bb08f50076b25f5bb93c72ae1016952210375e00eb72e29da82b89367947f29ef34afb75e8654f6ea368e0acdfd92976b7c2103a1b26313f430c4b15bb1fdce663207659d8cac749a0e53d70eff01874496feff2103c96d495bfdd5ba4145e3e046fee45e84a8a48ad05bd8dbb395c011a32cf9f88053ae00000000", 766),
+                (true, "01000000000101a3ccad197118a2d4975fadc47b90eacfdeaf8268adfdf10ed3b4c3b7e1ad14530300000000ffffffff0200cc5501000000001976a91428ec6f21f4727bff84bb844e9697366feeb69f4d88aca2a5100d00000000220020701a8d401c84fb13e6baf169d59684e17abd9fa216c8cc5b9fc63d622ff8c58d04004730440220548f11130353b3a8f943d2f14260345fc7c20bde91704c9f1cbb5456355078cd0220383ed4ed39b079b618bcb279bbc1f2ca18cb028c4641cb522c9c5868c52a0dc20147304402203c332ecccb3181ca82c0600520ee51fee80d3b4a6ab110945e59475ec71e44ac0220679a11f3ca9993b04ccebda3c834876f353b065bb08f50076b25f5bb93c72ae1016952210375e00eb72e29da82b89367947f29ef34afb75e8654f6ea368e0acdfd92976b7c2103a1b26313f430c4b15bb1fdce663207659d8cac749a0e53d70eff01874496feff2103c96d495bfdd5ba4145e3e046fee45e84a8a48ad05bd8dbb395c011a32cf9f88053ae00000000", Weight::from_wu(766)),
                 // one segwit input (P2WPKH) and two legacy inputs (P2PKH)
-                (true, "010000000001036b6b6ac7e34e97c53c1cc74c99c7948af2e6aac75d8778004ae458d813456764000000006a473044022001deec7d9075109306320b3754188f81a8236d0d232b44bc69f8309115638b8f02204e17a5194a519cf994d0afeea1268740bdc10616b031a521113681cc415e815c012103488d3272a9fad78ee887f0684cb8ebcfc06d0945e1401d002e590c7338b163feffffffffc75bd7aa6424aee972789ec28ba181254ee6d8311b058d165bd045154d7660b0000000006b483045022100c8641bcbee3e4c47a00417875015d8c5d5ea918fb7e96f18c6ffe51bc555b401022074e2c46f5b1109cd79e39a9aa203eadd1d75356415e51d80928a5fb5feb0efee0121033504b4c6dfc3a5daaf7c425aead4c2dbbe4e7387ce8e6be2648805939ecf7054ffffffff494df3b205cd9430a26f8e8c0dc0bb80496fbc555a524d6ea307724bc7e60eee0100000000ffffffff026d861500000000001976a9145c54ed1360072ebaf56e87693b88482d2c6a101588ace407000000000000160014761e31e2629c6e11936f2f9888179d60a5d4c1f900000247304402201fa38a67a63e58b67b6cfffd02f59121ca1c8a1b22e1efe2573ae7e4b4f06c2b022002b9b431b58f6e36b3334fb14eaecee7d2f06967a77ef50d8d5f90dda1057f0c01210257dc6ce3b1100903306f518ee8fa113d778e403f118c080b50ce079fba40e09a00000000", 1755),
+                (true, "010000000001036b6b6ac7e34e97c53c1cc74c99c7948af2e6aac75d8778004ae458d813456764000000006a473044022001deec7d9075109306320b3754188f81a8236d0d232b44bc69f8309115638b8f02204e17a5194a519cf994d0afeea1268740bdc10616b031a521113681cc415e815c012103488d3272a9fad78ee887f0684cb8ebcfc06d0945e1401d002e590c7338b163feffffffffc75bd7aa6424aee972789ec28ba181254ee6d8311b058d165bd045154d7660b0000000006b483045022100c8641bcbee3e4c47a00417875015d8c5d5ea918fb7e96f18c6ffe51bc555b401022074e2c46f5b1109cd79e39a9aa203eadd1d75356415e51d80928a5fb5feb0efee0121033504b4c6dfc3a5daaf7c425aead4c2dbbe4e7387ce8e6be2648805939ecf7054ffffffff494df3b205cd9430a26f8e8c0dc0bb80496fbc555a524d6ea307724bc7e60eee0100000000ffffffff026d861500000000001976a9145c54ed1360072ebaf56e87693b88482d2c6a101588ace407000000000000160014761e31e2629c6e11936f2f9888179d60a5d4c1f900000247304402201fa38a67a63e58b67b6cfffd02f59121ca1c8a1b22e1efe2573ae7e4b4f06c2b022002b9b431b58f6e36b3334fb14eaecee7d2f06967a77ef50d8d5f90dda1057f0c01210257dc6ce3b1100903306f518ee8fa113d778e403f118c080b50ce079fba40e09a00000000", Weight::from_wu(1755)),
                 // three legacy inputs (P2PKH)
-                (false, "0100000003e4d7be4314204a239d8e00691128dca7927e19a7339c7948bde56f669d27d797010000006b483045022100b988a858e2982e2daaf0755b37ad46775d6132057934877a5badc91dee2f66ff022020b967c1a2f0916007662ec609987e951baafa6d4fda23faaad70715611d6a2501210254a2dccd8c8832d4677dc6f0e562eaaa5d11feb9f1de2c50a33832e7c6190796ffffffff9e22eb1b3f24c260187d716a8a6c2a7efb5af14a30a4792a6eeac3643172379c000000006a47304402207df07f0cd30dca2cf7bed7686fa78d8a37fe9c2254dfdca2befed54e06b779790220684417b8ff9f0f6b480546a9e90ecee86a625b3ea1e4ca29b080da6bd6c5f67e01210254a2dccd8c8832d4677dc6f0e562eaaa5d11feb9f1de2c50a33832e7c6190796ffffffff1123df3bfb503b59769731da103d4371bc029f57979ebce68067768b958091a1000000006a47304402207a016023c2b0c4db9a7d4f9232fcec2193c2f119a69125ad5bcedcba56dd525e02206a734b3a321286c896759ac98ebfd9d808df47f1ce1fbfbe949891cc3134294701210254a2dccd8c8832d4677dc6f0e562eaaa5d11feb9f1de2c50a33832e7c6190796ffffffff0200c2eb0b000000001976a914e5eb3e05efad136b1405f5c2f9adb14e15a35bb488ac88cfff1b000000001976a9144846db516db3130b7a3c92253599edec6bc9630b88ac00000000", 2080),
+                (false, "0100000003e4d7be4314204a239d8e00691128dca7927e19a7339c7948bde56f669d27d797010000006b483045022100b988a858e2982e2daaf0755b37ad46775d6132057934877a5badc91dee2f66ff022020b967c1a2f0916007662ec609987e951baafa6d4fda23faaad70715611d6a2501210254a2dccd8c8832d4677dc6f0e562eaaa5d11feb9f1de2c50a33832e7c6190796ffffffff9e22eb1b3f24c260187d716a8a6c2a7efb5af14a30a4792a6eeac3643172379c000000006a47304402207df07f0cd30dca2cf7bed7686fa78d8a37fe9c2254dfdca2befed54e06b779790220684417b8ff9f0f6b480546a9e90ecee86a625b3ea1e4ca29b080da6bd6c5f67e01210254a2dccd8c8832d4677dc6f0e562eaaa5d11feb9f1de2c50a33832e7c6190796ffffffff1123df3bfb503b59769731da103d4371bc029f57979ebce68067768b958091a1000000006a47304402207a016023c2b0c4db9a7d4f9232fcec2193c2f119a69125ad5bcedcba56dd525e02206a734b3a321286c896759ac98ebfd9d808df47f1ce1fbfbe949891cc3134294701210254a2dccd8c8832d4677dc6f0e562eaaa5d11feb9f1de2c50a33832e7c6190796ffffffff0200c2eb0b000000001976a914e5eb3e05efad136b1405f5c2f9adb14e15a35bb488ac88cfff1b000000001976a9144846db516db3130b7a3c92253599edec6bc9630b88ac00000000", Weight::from_wu(2080)),
                 // one segwit input (P2TR)
-                (true, "01000000000101b5cee87f1a60915c38bb0bc26aaf2b67be2b890bbc54bb4be1e40272e0d2fe0b0000000000ffffffff025529000000000000225120106daad8a5cb2e6fc74783714273bad554a148ca2d054e7a19250e9935366f3033760000000000002200205e6d83c44f57484fd2ef2a62b6d36cdcd6b3e06b661e33fd65588a28ad0dbe060141df9d1bfce71f90d68bf9e9461910b3716466bfe035c7dbabaa7791383af6c7ef405a3a1f481488a91d33cd90b098d13cb904323a3e215523aceaa04e1bb35cdb0100000000", 617),
+                (true, "01000000000101b5cee87f1a60915c38bb0bc26aaf2b67be2b890bbc54bb4be1e40272e0d2fe0b0000000000ffffffff025529000000000000225120106daad8a5cb2e6fc74783714273bad554a148ca2d054e7a19250e9935366f3033760000000000002200205e6d83c44f57484fd2ef2a62b6d36cdcd6b3e06b661e33fd65588a28ad0dbe060141df9d1bfce71f90d68bf9e9461910b3716466bfe035c7dbabaa7791383af6c7ef405a3a1f481488a91d33cd90b098d13cb904323a3e215523aceaa04e1bb35cdb0100000000", Weight::from_wu(617)),
                 // one legacy input (P2PKH)
-                (false, "0100000001c336895d9fa674f8b1e294fd006b1ac8266939161600e04788c515089991b50a030000006a47304402204213769e823984b31dcb7104f2c99279e74249eacd4246dabcf2575f85b365aa02200c3ee89c84344ae326b637101a92448664a8d39a009c8ad5d147c752cbe112970121028b1b44b4903c9103c07d5a23e3c7cf7aeb0ba45ddbd2cfdce469ab197381f195fdffffff040000000000000000536a4c5058325bb7b7251cf9e36cac35d691bd37431eeea426d42cbdecca4db20794f9a4030e6cb5211fabf887642bcad98c9994430facb712da8ae5e12c9ae5ff314127d33665000bb26c0067000bb0bf00322a50c300000000000017a9145ca04fdc0a6d2f4e3f67cfeb97e438bb6287725f8750c30000000000001976a91423086a767de0143523e818d4273ddfe6d9e4bbcc88acc8465003000000001976a914c95cbacc416f757c65c942f9b6b8a20038b9b12988ac00000000", 1396),
+                (false, "0100000001c336895d9fa674f8b1e294fd006b1ac8266939161600e04788c515089991b50a030000006a47304402204213769e823984b31dcb7104f2c99279e74249eacd4246dabcf2575f85b365aa02200c3ee89c84344ae326b637101a92448664a8d39a009c8ad5d147c752cbe112970121028b1b44b4903c9103c07d5a23e3c7cf7aeb0ba45ddbd2cfdce469ab197381f195fdffffff040000000000000000536a4c5058325bb7b7251cf9e36cac35d691bd37431eeea426d42cbdecca4db20794f9a4030e6cb5211fabf887642bcad98c9994430facb712da8ae5e12c9ae5ff314127d33665000bb26c0067000bb0bf00322a50c300000000000017a9145ca04fdc0a6d2f4e3f67cfeb97e438bb6287725f8750c30000000000001976a91423086a767de0143523e818d4273ddfe6d9e4bbcc88acc8465003000000001976a914c95cbacc416f757c65c942f9b6b8a20038b9b12988ac00000000", Weight::from_wu(1396)),
             ];
 
         let empty_transaction_weight = Transaction {
@@ -1974,32 +1776,32 @@ mod tests {
             input: vec![],
             output: vec![],
         }
-        .check_weight();
+        .weight();
 
-        for (is_segwit, tx, expected_wu) in &txs {
+        for (is_segwit, tx, expected_weight) in &txs {
             let txin_weight = if *is_segwit { TxIn::segwit_weight } else { TxIn::legacy_weight };
             let tx: Transaction = deserialize(Vec::from_hex(tx).unwrap().as_slice()).unwrap();
             // The empty tx size doesn't include the segwit marker (`0001`), so, in case of segwit txs,
             // we have to manually add it ourselves
-            let segwit_marker_weight = if *is_segwit { 2 } else { 0 };
-            let calculated_size = empty_transaction_weight.to_wu() as usize
+            let segwit_marker_weight = if *is_segwit { Weight::from_wu(2) } else { Weight::ZERO };
+            let calculated_size = empty_transaction_weight
                 + segwit_marker_weight
-                + tx.input.iter().fold(0, |sum, i| sum + txin_weight(i))
-                + tx.output.iter().fold(0, |sum, o| sum + o.weight());
-            assert_eq!(calculated_size, tx.check_weight().to_wu() as usize);
+                + tx.input.iter().fold(Weight::ZERO, |sum, i| sum + txin_weight(i))
+                + tx.output.iter().fold(Weight::ZERO, |sum, o| sum + o.weight());
+            assert_eq!(calculated_size, tx.weight());
 
-            assert_eq!(tx.weight().to_wu(), *expected_wu);
+            assert_eq!(tx.weight(), *expected_weight);
         }
     }
 }
 
 #[cfg(bench)]
 mod benches {
+    use hex_lit::hex;
     use test::{black_box, Bencher};
 
     use super::Transaction;
     use crate::consensus::{deserialize, Encodable};
-    use crate::internal_macros::hex;
     use crate::EmptyWrite;
 
     const SOME_TX: &str = "0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000";

@@ -41,6 +41,7 @@ dependencies = [
  "bitcoin_hashes",
  "bitcoinconsensus",
  "core2",
+ "hex-conservative",
  "hex_lit",
  "mutagen",
  "secp256k1",
@@ -63,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-internals"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
@@ -74,6 +75,7 @@ version = "0.12.0"
 dependencies = [
  "bitcoin-internals",
  "core2",
+ "hex-conservative",
  "schemars",
  "serde",
  "serde_json",
@@ -162,6 +164,15 @@ name = "half"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62aca2aba2d62b4a7f5b33f3712cb1b0692779a56fb510499d5c0aa594daeaf3"
+
+[[package]]
+name = "hex-conservative"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30ed443af458ccb6d81c1e7e661545f94d3176752fb1df2f543b902a1e0f51e2"
+dependencies = [
+ "core2",
+]
 
 [[package]]
 name = "hex_lit"
@@ -278,9 +289,9 @@ checksum = "237a5ed80e274dbc66f86bd59c1e25edc039660be53194b5fe0a482e0f2612ea"
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.56"
+version = "1.0.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b63bdb0cd06f1f4dedf69b254734f9b45af66e4a031e42a7480257d9898b435"
+checksum = "7b368fba921b0dce7e60f5e04ec15e565b3303972b42bcfde1d0713b881959eb"
 dependencies = [
  "unicode-ident",
 ]

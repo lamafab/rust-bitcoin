@@ -25,7 +25,7 @@ mod primitive {
     use crate::prelude::*;
 
     #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
-    fn check_limit(len: usize) -> Result<(), PushBytesError> { Ok(()) }
+    fn check_limit(_: usize) -> Result<(), PushBytesError> { Ok(()) }
 
     #[cfg(not(any(target_pointer_width = "16", target_pointer_width = "32")))]
     fn check_limit(len: usize) -> Result<(), PushBytesError> {
@@ -369,7 +369,7 @@ mod error {
 
     /// Error returned on attempt to create too large `PushBytes`.
     #[allow(unused)]
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PushBytesError {
         never: core::convert::Infallible,
     }
@@ -380,7 +380,7 @@ mod error {
     }
 
     impl fmt::Display for PushBytesError {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { match self.never {} }
+        fn fmt(&self, _: &mut fmt::Formatter) -> fmt::Result { match self.never {} }
     }
 }
 
@@ -391,7 +391,7 @@ mod error {
     use core::fmt;
 
     /// Error returned on attempt to create too large `PushBytes`.
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PushBytesError {
         /// How long the input was.
         pub(super) len: usize,

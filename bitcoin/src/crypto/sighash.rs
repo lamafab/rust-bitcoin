@@ -16,11 +16,18 @@ use core::{fmt, str};
 
 use hashes::{hash_newtype, sha256, sha256d, sha256t_hash_newtype, Hash};
 
-use crate::blockdata::transaction::EncodeSigningDataResult;
+#[cfg(feature = "rand-std")]
+use secp256k1::{Signing, Verification, schnorr};
+#[cfg(feature = "rand-std")]
+use crate::key::{UntweakedKeyPair, TweakedKeyPair, KeyPair, Secp256k1, TapTweak};
+#[cfg(feature = "rand-std")]
+use crate::taproot::TapNodeHash;
+
 use crate::blockdata::witness::Witness;
 use crate::consensus::{encode, Encodable};
 use crate::error::impl_std_error;
 use crate::prelude::*;
+use crate::script::P2wpkChecked;
 use crate::taproot::{LeafVersion, TapLeafHash, TAPROOT_ANNEX_PREFIX};
 use crate::{io, Amount, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
 
@@ -59,7 +66,7 @@ sha256t_hash_newtype! {
 
     /// Taproot-tagged hash with tag \"TapSighash\".
     ///
-    /// This hash type is used for computing taproot signature hash."
+    /// This hash type is used for computing taproot signature hash.
     #[hash_newtype(forward)]
     pub struct TapSighash(_);
 }
@@ -199,7 +206,7 @@ impl str::FromStr for TapSighashType {
 }
 
 /// Possible errors in computing the signature message.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// Could happen only by using `*_encode_signing_*` methods with custom writers, engines writers
@@ -248,12 +255,12 @@ impl fmt::Display for Error {
 
         match self {
             Io(error_kind) => write!(f, "writer errored: {:?}", error_kind),
-            IndexOutOfInputsBounds { index, inputs_size } => write!(f, "Requested index ({}) is greater or equal than the number of transaction inputs ({})", index, inputs_size),
+            IndexOutOfInputsBounds { index, inputs_size } => write!(f, "requested index ({}) is greater or equal than the number of transaction inputs ({})", index, inputs_size),
             SingleWithoutCorrespondingOutput { index, outputs_size } => write!(f, "SIGHASH_SINGLE for input ({}) haven't a corresponding output (#outputs:{})", index, outputs_size),
-            PrevoutsSize => write!(f, "Number of supplied prevouts differs from the number of inputs in transaction"),
-            PrevoutIndex => write!(f, "The index requested is greater than available prevouts or different from the provided [Provided::Anyone] index"),
-            PrevoutKind => write!(f, "A single prevout has been provided but all prevouts are needed without `ANYONECANPAY`"),
-            WrongAnnex => write!(f, "Annex must be at least one byte long and the first bytes must be `0x50`"),
+            PrevoutsSize => write!(f, "number of supplied prevouts differs from the number of inputs in transaction"),
+            PrevoutIndex => write!(f, "the index requested is greater than available prevouts or different from the provided [Provided::Anyone] index"),
+            PrevoutKind => write!(f, "a single prevout has been provided but all prevouts are needed without `ANYONECANPAY`"),
+            WrongAnnex => write!(f, "annex must be at least one byte long and the first bytes must be `0x50`"),
             InvalidSighashType(hash_ty) => write!(f, "Invalid taproot signature hash type : {} ", hash_ty),
         }
     }
@@ -275,6 +282,10 @@ impl std::error::Error for Error {
             | InvalidSighashType(_) => None,
         }
     }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self { Error::Io(e.kind()) }
 }
 
 impl<'u, T> Prevouts<'u, T>
@@ -325,8 +336,8 @@ impl<'s> ScriptPath<'s> {
         self.leaf_version
             .to_consensus()
             .consensus_encode(&mut enc)
-            .expect("Writing to hash enging should never fail");
-        self.script.consensus_encode(&mut enc).expect("Writing to hash enging should never fail");
+            .expect("writing to hash enging should never fail");
+        self.script.consensus_encode(&mut enc).expect("writing to hash enging should never fail");
 
         TapLeafHash::from_engine(enc)
     }
@@ -446,7 +457,7 @@ impl EcdsaSighashType {
     /// # Errors
     ///
     /// If `n` is a non-standard sighash value.
-    pub fn from_standard(n: u32) -> Result<EcdsaSighashType, NonStandardSighashType> {
+    pub fn from_standard(n: u32) -> Result<EcdsaSighashType, NonStandardSighashTypeError> {
         use EcdsaSighashType::*;
 
         match n {
@@ -457,7 +468,7 @@ impl EcdsaSighashType {
             0x81 => Ok(AllPlusAnyoneCanPay),
             0x82 => Ok(NonePlusAnyoneCanPay),
             0x83 => Ok(SinglePlusAnyoneCanPay),
-            non_standard => Err(NonStandardSighashType(non_standard)),
+            non_standard => Err(NonStandardSighashTypeError(non_standard)),
         }
     }
 
@@ -499,7 +510,7 @@ impl TapSighashType {
     }
 
     /// Constructs a [`TapSighashType`] from a raw `u8`.
-    pub fn from_consensus_u8(hash_ty: u8) -> Result<Self, Error> {
+    pub fn from_consensus_u8(hash_ty: u8) -> Result<Self, InvalidSighashTypeError> {
         use TapSighashType::*;
 
         Ok(match hash_ty {
@@ -510,28 +521,93 @@ impl TapSighashType {
             0x81 => AllPlusAnyoneCanPay,
             0x82 => NonePlusAnyoneCanPay,
             0x83 => SinglePlusAnyoneCanPay,
-            x => return Err(Error::InvalidSighashType(x as u32)),
+            x => return Err(InvalidSighashTypeError(x.into())),
         })
     }
 }
 
-/// This type is consensus valid but an input including it would prevent the transaction from
-/// being relayed on today's Bitcoin network.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NonStandardSighashType(pub u32);
-
-impl fmt::Display for NonStandardSighashType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Non standard sighash type {}", self.0)
+impl TapSighash {
+    /// Signs the sighash for a P2TR key-path spending transaction with a
+    /// [`KeyPair`] and creates a Schnorr signature as defined in [BIP340]. For
+    /// P2TR script-path use [`sign_schnorr`] directly.
+    ///
+    /// [BIP340]: https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
+    /// [`sign_schnorr`]: <TapSighash::sign_schnorr>
+    #[cfg(feature = "rand-std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rand-std")))]
+    pub fn sign_schnorr_key_spend<C: Signing + Verification>(
+        &self,
+        secp: &Secp256k1<C>,
+        keypair: &KeyPair
+    ) -> schnorr::Signature {
+        // Tweak keypair with zeroed merkle root.
+        self.sign_schnorr_tweak(secp, keypair, None)
+    }
+    /// Signs the sighash by tweaking the [`UntweakedKeyPair`] with a some
+    /// optional script tree merkle root [`TapNodeHash`] and creates a Schnorr
+    /// signature as defined in [BIP340].
+    ///
+    /// [BIP340]: https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
+    #[cfg(feature = "rand-std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rand-std")))]
+    pub fn sign_schnorr_tweak<C: Signing + Verification>(
+        &self,
+        secp: &Secp256k1<C>,
+        keypair: &UntweakedKeyPair,
+        merkle_root: Option<TapNodeHash>
+    ) -> schnorr::Signature {
+        let tweaked: TweakedKeyPair = keypair.tap_tweak(secp, merkle_root);
+        let msg = secp256k1::Message::from_slice(self.as_ref()).unwrap();
+        secp.sign_schnorr(&msg, &tweaked.to_inner())
+    }
+    /// Signs the sighash with a [`KeyPair`] without applying a tweak and
+    /// creates a Schnorr signature as defined in [BIP340]. This is used for
+    /// spending P2TR script-path inputs.
+    ///
+    /// [BIP340]: https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
+    #[cfg(feature = "rand-std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rand-std")))]
+    pub fn sign_schnorr<C: Signing>(
+        &self,
+        secp: &Secp256k1<C>,
+        keypair: &KeyPair
+    ) -> schnorr::Signature {
+        // Prepare secp256k1 message. This unwrap never panics since the sighash
+        // is always 32 bytes.
+        let msg = secp256k1::Message::from_slice(self.as_ref()).unwrap();
+        secp.sign_schnorr(&msg, keypair)
     }
 }
 
-impl_std_error!(NonStandardSighashType);
+/// Integer is not a consensus valid sighash type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InvalidSighashTypeError(pub u32);
+
+impl fmt::Display for InvalidSighashTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "invalid sighash type {}", self.0)
+    }
+}
+
+impl_std_error!(InvalidSighashTypeError);
+
+/// This type is consensus valid but an input including it would prevent the transaction from
+/// being relayed on today's Bitcoin network.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NonStandardSighashTypeError(pub u32);
+
+impl fmt::Display for NonStandardSighashTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "non-standard sighash type {}", self.0)
+    }
+}
+
+impl_std_error!(NonStandardSighashTypeError);
 
 /// Error returned for failure during parsing one of the sighash types.
 ///
 /// This is currently returned for unrecognized sighash strings.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SighashTypeParseError {
     /// The unrecognized string we attempted to parse.
     pub unrecognized: String,
@@ -539,7 +615,7 @@ pub struct SighashTypeParseError {
 
 impl fmt::Display for SighashTypeParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Unrecognized SIGHASH string '{}'", self.unrecognized)
+        write!(f, "unrecognized SIGHASH string '{}'", self.unrecognized)
     }
 }
 
@@ -806,6 +882,7 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
     }
 
     /// Computes the BIP143 sighash for any flag type.
+    #[deprecated(note = "use `segwit_script_code_signature_hash` instead")]
     pub fn segwit_signature_hash(
         &mut self,
         input_index: usize,
@@ -821,6 +898,25 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
             value,
             sighash_type,
         )?;
+        Ok(SegwitV0Sighash::from_engine(enc))
+    }
+
+    /// Computes the BIP143 sighash for any flag type.
+    pub fn segwit_script_code_signature_hash(
+        &mut self,
+        input_index: usize,
+        script_code: &P2wpkChecked,
+        value: Amount,
+        sighash_type: EcdsaSighashType,
+    ) -> Result<SegwitV0Sighash, Error> {
+        let mut enc = SegwitV0Sighash::engine();
+        self.segwit_encode_signing_data_to(
+            &mut enc,
+            input_index,
+            script_code.as_script(),
+            value,
+            sighash_type,
+        ).expect("invalid Segwit script code");
         Ok(SegwitV0Sighash::from_engine(enc))
     }
 
@@ -1062,7 +1158,7 @@ impl<R: BorrowMut<Transaction>> SighashCache<R> {
     ///
     /// let mut sig_hasher = SighashCache::new(&mut tx_to_sign);
     /// for inp in 0..input_count {
-    ///     let prevout_script = Script::empty();
+    ///     let prevout_script = Script::new();
     ///     let _sighash = sig_hasher.segwit_signature_hash(inp, prevout_script, Amount::ONE_SAT, EcdsaSighashType::All);
     ///     // ... sign the sighash
     ///     sig_hasher.witness_mut(inp).unwrap().push(&Vec::new());
@@ -1071,10 +1167,6 @@ impl<R: BorrowMut<Transaction>> SighashCache<R> {
     pub fn witness_mut(&mut self, input_index: usize) -> Option<&mut Witness> {
         self.tx.borrow_mut().input.get_mut(input_index).map(|i| &mut i.witness)
     }
-}
-
-impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Self { Error::Io(e.kind()) }
 }
 
 /// The `Annex` struct is a slice wrapper enforcing first byte is `0x50`.
@@ -1106,12 +1198,81 @@ fn is_invalid_use_of_sighash_single(sighash: u32, input_index: usize, output_len
     ty == EcdsaSighashType::Single && input_index >= output_len
 }
 
+/// Result of [`SighashCache::legacy_encode_signing_data_to`].
+///
+/// This type forces the caller to handle SIGHASH_SINGLE bug case.
+///
+/// This corner case can't be expressed using standard `Result`,
+/// in a way that is both convenient and not-prone to accidental
+/// mistakes (like calling `.expect("writer never fails")`).
+#[must_use]
+pub enum EncodeSigningDataResult<E> {
+    /// Input data is an instance of `SIGHASH_SINGLE` bug
+    SighashSingleBug,
+    /// Operation performed normally.
+    WriteResult(Result<(), E>),
+}
+
+impl<E> EncodeSigningDataResult<E> {
+    /// Checks for SIGHASH_SINGLE bug returning error if the writer failed.
+    ///
+    /// This method is provided for easy and correct handling of the result because
+    /// SIGHASH_SINGLE bug is a special case that must not be ignored nor cause panicking.
+    /// Since the data is usually written directly into a hasher which never fails,
+    /// the recommended pattern to handle this is:
+    ///
+    /// ```rust
+    /// # use bitcoin::consensus::deserialize;
+    /// # use bitcoin::hashes::{Hash, hex::FromHex};
+    /// # use bitcoin::sighash::{LegacySighash, SighashCache};
+    /// # use bitcoin::Transaction;
+    /// # let mut writer = LegacySighash::engine();
+    /// # let input_index = 0;
+    /// # let script_pubkey = bitcoin::ScriptBuf::new();
+    /// # let sighash_u32 = 0u32;
+    /// # const SOME_TX: &'static str = "0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000";
+    /// # let raw_tx = Vec::from_hex(SOME_TX).unwrap();
+    /// # let tx: Transaction = deserialize(&raw_tx).unwrap();
+    /// let cache = SighashCache::new(&tx);
+    /// if cache.legacy_encode_signing_data_to(&mut writer, input_index, &script_pubkey, sighash_u32)
+    ///         .is_sighash_single_bug()
+    ///         .expect("writer can't fail") {
+    ///     // use a hash value of "1", instead of computing the actual hash due to SIGHASH_SINGLE bug
+    /// }
+    /// ```
+    #[allow(clippy::wrong_self_convention)] // E is not Copy so we consume self.
+    pub fn is_sighash_single_bug(self) -> Result<bool, E> {
+        match self {
+            EncodeSigningDataResult::SighashSingleBug => Ok(true),
+            EncodeSigningDataResult::WriteResult(Ok(())) => Ok(false),
+            EncodeSigningDataResult::WriteResult(Err(e)) => Err(e),
+        }
+    }
+
+    /// Maps a `Result<T, E>` to `Result<T, F>` by applying a function to a
+    /// contained [`Err`] value, leaving an [`Ok`] value untouched.
+    ///
+    /// Like [`Result::map_err`].
+    pub fn map_err<E2, F>(self, f: F) -> EncodeSigningDataResult<E2>
+    where
+        F: FnOnce(E) -> E2,
+    {
+        match self {
+            EncodeSigningDataResult::SighashSingleBug => EncodeSigningDataResult::SighashSingleBug,
+            EncodeSigningDataResult::WriteResult(Err(e)) =>
+                EncodeSigningDataResult::WriteResult(Err(f(e))),
+            EncodeSigningDataResult::WriteResult(Ok(o)) =>
+                EncodeSigningDataResult::WriteResult(Ok(o)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
-    use hashes::hex::FromHex;
     use hashes::HashEngine;
+    use hex::FromHex;
 
     use super::*;
     use crate::address::Address;
@@ -1120,7 +1281,7 @@ mod tests {
     use crate::crypto::key::PublicKey;
     use crate::crypto::sighash::{LegacySighash, TapSighash};
     use crate::internal_macros::hex;
-    use crate::network::constants::Network;
+    use crate::network::Network;
     use crate::taproot::TapLeafHash;
 
     extern crate serde_json;
@@ -1364,7 +1525,7 @@ mod tests {
             })
         );
         assert_eq!(
-            c.legacy_signature_hash(10, Script::empty(), 0u32),
+            c.legacy_signature_hash(10, Script::new(), 0u32),
             Err(Error::IndexOutOfInputsBounds {
                 index: 10,
                 inputs_size: 1
@@ -1654,7 +1815,7 @@ mod tests {
         for s in sht_mistakes {
             assert_eq!(
                 TapSighashType::from_str(s).unwrap_err().to_string(),
-                format!("Unrecognized SIGHASH string '{}'", s)
+                format!("unrecognized SIGHASH string '{}'", s)
             );
         }
     }
@@ -1677,11 +1838,13 @@ mod tests {
 
         let witness_script =
             p2pkh_hex("025476c2e83188368da1ff3e292e7acafcdb3566bb0ad253f62fc70f07aeee6357");
+
+        let script_code = witness_script.p2wpkh_checked();
         let value = Amount::from_sat(600_000_000);
 
         let mut cache = SighashCache::new(&tx);
         assert_eq!(
-            cache.segwit_signature_hash(1, &witness_script, value, EcdsaSighashType::All).unwrap(),
+            cache.segwit_script_code_signature_hash(1, &script_code, value, EcdsaSighashType::All).unwrap(),
             "c37af31116d1b27caf68aae9e3ac82f1477929014d5b917657d0eb49478cb670"
                 .parse::<SegwitV0Sighash>()
                 .unwrap(),
@@ -1718,11 +1881,13 @@ mod tests {
 
         let witness_script =
             p2pkh_hex("03ad1d8e89212f0b92c74d23bb710c00662ad1470198ac48c43f7d6f93a2a26873");
+
+        let script_code = witness_script.p2wpkh_checked();
         let value = Amount::from_sat(1_000_000_000);
 
         let mut cache = SighashCache::new(&tx);
         assert_eq!(
-            cache.segwit_signature_hash(0, &witness_script, value, EcdsaSighashType::All).unwrap(),
+            cache.segwit_script_code_signature_hash(0, &script_code, value, EcdsaSighashType::All).unwrap(),
             "64f3b0f4dd2bb3aa1ce8566d220cc74dda9df97d8490cc81d89d735c92e59fb6"
                 .parse::<SegwitV0Sighash>()
                 .unwrap(),
@@ -1765,11 +1930,13 @@ mod tests {
              56ae",
         )
         .unwrap();
+
+        let script_code = witness_script.p2wpkh_checked();
         let value = Amount::from_sat(987_654_321);
 
         let mut cache = SighashCache::new(&tx);
         assert_eq!(
-            cache.segwit_signature_hash(0, &witness_script, value, EcdsaSighashType::All).unwrap(),
+            cache.segwit_script_code_signature_hash(0, &script_code, value, EcdsaSighashType::All).unwrap(),
             "185c0be5263dce5b4bb50a047973c1b6272bfbd0103a89444597dc40b248ee7c"
                 .parse::<SegwitV0Sighash>()
                 .unwrap(),
@@ -1792,5 +1959,45 @@ mod tests {
             &Vec::from_hex("bc4d309071414bed932f98832b27b4d76dad7e6c1346f487a8fdbb8eb90307cc")
                 .unwrap()[..],
         );
+    }
+
+    #[test]
+    #[cfg(feature = "rand-std")]
+    fn bip_341_sighash_sign_method_tests() {
+        let secp = &secp256k1::Secp256k1::new();
+        let keypair = KeyPair::new(secp, &mut secp256k1::rand::thread_rng());
+        let (untweaked_xpubkey, _) = keypair.x_only_public_key();
+
+        // Tap keypair manually, then verify signature with
+        // secp256k1::verify_schnorr directly.
+        let tweaked = keypair.tap_tweak(secp, None);
+        let (tweaked_xpubkey, _) = tweaked.to_inner().x_only_public_key();
+
+        // The sighash to be signed and verified.
+        let hash = Hash::from_slice(&[1; 32]).unwrap();
+        let sighash = TapSighash::from_raw_hash(hash);
+
+        // Sign sighash without a tweak to the keypair.
+        let unweaked_sig = sighash.sign_schnorr(secp, &keypair);
+        let sighash_msg = secp256k1::Message::from(sighash);
+
+        // Trying to verify an untweaked signature with a tweaked pubkey (invalid).
+        let res = secp.verify_schnorr(&unweaked_sig, &sighash_msg, &tweaked_xpubkey);
+        assert!(res.is_err());
+
+        // Trying to verify an untweaked signature with a untweaked pubkey (valid).
+        let res = secp.verify_schnorr(&unweaked_sig, &sighash_msg, &untweaked_xpubkey);
+        assert!(res.is_ok());
+
+        // Sign sighash *with* a tweak to the keypair (valid).
+        let tweaked_sig = sighash.sign_schnorr_key_spend(secp, &keypair);
+
+        // Trying to verify a tweaked signature with a tweaked pubkey (valid).
+        let res = secp.verify_schnorr(&tweaked_sig, &sighash_msg, &tweaked_xpubkey);
+        assert!(res.is_ok());
+
+        // Trying to verify a tweaked signature with a untweaked pubkey (invalid).
+        let res = secp.verify_schnorr(&tweaked_sig, &sighash_msg, &untweaked_xpubkey);
+        assert!(res.is_err());
     }
 }

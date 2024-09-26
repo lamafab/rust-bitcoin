@@ -12,7 +12,7 @@ use core::ops::Index;
 use core::str::FromStr;
 use core::{fmt, slice};
 
-use hashes::{hex, sha512, Hash, HashEngine, Hmac, HmacEngine};
+use hashes::{sha512, Hash, HashEngine, Hmac, HmacEngine};
 use internals::{impl_array_newtype, write_err};
 use secp256k1::{self, Secp256k1, XOnlyPublicKey};
 #[cfg(feature = "serde")]
@@ -23,7 +23,7 @@ use crate::crypto::key::{self, KeyPair, PrivateKey, PublicKey};
 use crate::hash_types::XpubIdentifier;
 use crate::internal_macros::impl_bytes_newtype;
 use crate::io::Write;
-use crate::network::constants::Network;
+use crate::network::Network;
 use crate::prelude::*;
 
 /// A chain code
@@ -65,7 +65,6 @@ pub struct ExtendedPrivKey {
 crate::serde_utils::serde_string_impl!(ExtendedPrivKey, "a BIP-32 extended private key");
 
 #[cfg(not(feature = "std"))]
-#[cfg_attr(docsrs, doc(cfg(not(feature = "std"))))]
 impl fmt::Debug for ExtendedPrivKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ExtendedPrivKey")
@@ -413,6 +412,20 @@ impl DerivationPath {
         new_path.0.extend_from_slice(path.as_ref());
         new_path
     }
+
+    /// Returns the derivation path as a vector of u32 integers.
+    /// Unhardened elements are copied as is.
+    /// 0x80000000 is added to the hardened elements.
+    ///
+    /// ```
+    /// use bitcoin::bip32::DerivationPath;
+    /// use std::str::FromStr;
+    ///
+    /// let path = DerivationPath::from_str("m/84'/0'/0'/0/1").unwrap();
+    /// const HARDENED: u32 = 0x80000000;
+    /// assert_eq!(path.to_u32_vec(), vec![84 + HARDENED, HARDENED, HARDENED, 0, 1]);
+    /// ```
+    pub fn to_u32_vec(&self) -> Vec<u32> { self.into_iter().map(|&el| el.into()).collect() }
 }
 
 impl fmt::Display for DerivationPath {
@@ -435,7 +448,7 @@ impl fmt::Debug for DerivationPath {
 pub type KeySource = (Fingerprint, DerivationPath);
 
 /// A BIP32 error
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// A pk->pk derivation was attempted on a hardened key
@@ -455,7 +468,7 @@ pub enum Error {
     /// Base58 encoding error
     Base58(base58::Error),
     /// Hexadecimal decoding error
-    Hex(hex::Error),
+    Hex(hex::HexToArrayError),
     /// `PublicKey` hex should be 66 or 130 digits long.
     InvalidPublicKeyHexLength(usize),
 }
@@ -853,7 +866,7 @@ mod tests {
     use super::ChildNumber::{Hardened, Normal};
     use super::*;
     use crate::internal_macros::hex;
-    use crate::network::constants::Network::{self, Bitcoin};
+    use crate::network::Network::{self, Bitcoin};
 
     #[test]
     fn test_parse_derivation_path() {

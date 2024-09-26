@@ -1061,10 +1061,6 @@ impl TaprootMerkleBranch {
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
 
     /// Decodes bytes from control block.
-    #[deprecated(since = "0.30.0", note = "Use decode instead")]
-    pub fn from_slice(sl: &[u8]) -> Result<Self, TaprootError> { Self::decode(sl) }
-
-    /// Decodes bytes from control block.
     ///
     /// This reads the branch as encoded in the control block: the concatenated 32B byte chunks -
     /// one for each hash.
@@ -1199,10 +1195,6 @@ pub struct ControlBlock {
 }
 
 impl ControlBlock {
-    /// Constructs a `ControlBlock` from slice.
-    #[deprecated(since = "0.30.0", note = "Use decode instead")]
-    pub fn from_slice(sl: &[u8]) -> Result<ControlBlock, TaprootError> { Self::decode(sl) }
-
     /// Decodes bytes representing a `ControlBlock`.
     ///
     /// This is an extra witness element that provides the proof that taproot script pubkey is
@@ -1435,7 +1427,7 @@ impl<'de> serde::Deserialize<'de> for LeafVersion {
 }
 
 /// Detailed error type for taproot builder.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TaprootBuilderError {
     /// Merkle tree depth must not be more than 128.
@@ -1491,7 +1483,7 @@ impl std::error::Error for TaprootBuilderError {
 }
 
 /// Detailed error type for taproot utilities.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TaprootError {
     /// Proof size must be a multiple of 32.
@@ -1561,9 +1553,9 @@ impl std::error::Error for TaprootError {
 mod test {
     use core::str::FromStr;
 
-    use hashes::hex::FromHex;
     use hashes::sha256t::Tag;
     use hashes::{sha256, Hash, HashEngine};
+    use hex::FromHex;
     use secp256k1::{VerifyOnly, XOnlyPublicKey};
 
     use super::*;

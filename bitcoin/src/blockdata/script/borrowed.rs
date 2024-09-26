@@ -9,16 +9,14 @@ use core::ops::{Index, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, Ran
 use hashes::Hash;
 use secp256k1::{Secp256k1, Verification};
 
-use crate::address::WitnessVersion;
 use crate::blockdata::opcodes::all::*;
-use crate::blockdata::opcodes::{self};
-#[cfg(feature = "bitcoinconsensus")]
-use crate::blockdata::script::Error;
+use crate::blockdata::opcodes::{self, Opcode};
+use crate::blockdata::script::witness_version::WitnessVersion;
 use crate::blockdata::script::{
     bytes_to_asm_fmt, Builder, Instruction, InstructionIndices, Instructions, ScriptBuf,
+    ScriptHash, WScriptHash,
 };
 use crate::consensus::Encodable;
-use crate::hash_types::{ScriptHash, WScriptHash};
 use crate::key::{PublicKey, UntweakedPublicKey};
 use crate::policy::DUST_RELAY_TX_FEE;
 use crate::prelude::*;
@@ -80,6 +78,10 @@ impl ToOwned for Script {
 }
 
 impl Script {
+    /// Creates a new empty script.
+    #[inline]
+    pub fn new() -> &'static Script { Script::from_bytes(&[]) }
+
     /// Treat byte slice as `Script`
     #[inline]
     pub fn from_bytes(bytes: &[u8]) -> &Script {
@@ -109,10 +111,6 @@ impl Script {
     /// Returns the script data as a mutable byte slice.
     #[inline]
     pub fn as_mut_bytes(&mut self) -> &mut [u8] { &mut self.0 }
-
-    /// Creates a new empty script.
-    #[inline]
-    pub fn empty() -> &'static Script { Script::from_bytes(&[]) }
 
     /// Creates a new script builder
     pub fn builder() -> Builder { Builder::new() }
@@ -168,7 +166,7 @@ impl Script {
     /// Returns witness version of the script, if any, assuming the script is a `scriptPubkey`.
     #[inline]
     pub fn witness_version(&self) -> Option<WitnessVersion> {
-        self.0.first().and_then(|opcode| WitnessVersion::try_from(opcodes::All::from(*opcode)).ok())
+        self.0.first().and_then(|opcode| WitnessVersion::try_from(Opcode::from(*opcode)).ok())
     }
 
     /// Checks whether a script pubkey is a P2SH output.
@@ -231,7 +229,7 @@ impl Script {
         if !(4..=42).contains(&script_len) {
             return false;
         }
-        let ver_opcode = opcodes::All::from(self.0[0]); // Version 0 or PUSHNUM_1-PUSHNUM_16
+        let ver_opcode = Opcode::from(self.0[0]); // Version 0 or PUSHNUM_1-PUSHNUM_16
         let push_opbyte = self.0[1]; // Second byte push opcode 2-40 bytes
         WitnessVersion::try_from(ver_opcode).is_ok()
             && push_opbyte >= OP_PUSHBYTES_2.to_u8()
@@ -288,13 +286,33 @@ impl Script {
 
         match self.0.first() {
             Some(b) => {
-                let first = opcodes::All::from(*b);
+                let first = Opcode::from(*b);
                 let class = first.classify(opcodes::ClassifyContext::Legacy);
 
                 class == ReturnOp || class == IllegalOp
             }
             None => false,
         }
+    }
+
+    /// Computes the P2SH output corresponding to this redeem script.
+    pub fn to_p2sh(&self) -> ScriptBuf { ScriptBuf::new_p2sh(&self.script_hash()) }
+
+    /// Returns the script code used for spending a P2WPKH output if this script is a script pubkey
+    /// for a P2WPKH output. The `scriptCode` is described in [BIP143].
+    ///
+    /// [BIP143]: <https://github.com/bitcoin/bips/blob/99701f68a88ce33b2d0838eb84e115cef505b4c2/bip-0143.mediawiki>
+    pub fn p2wpkh_script_code(&self) -> Option<ScriptBuf> {
+        self.v0_p2wpkh().map(|wpkh| {
+            Builder::new()
+                .push_opcode(OP_DUP)
+                .push_opcode(OP_HASH160)
+                // The `self` script is 0x00, 0x14, <pubkey_hash>
+                .push_slice(wpkh)
+                .push_opcode(OP_EQUALVERIFY)
+                .push_opcode(OP_CHECKSIG)
+                .into_script()
+        })
     }
 
     /// Returns the minimum value an output with this script should have in order to be
@@ -437,46 +455,6 @@ impl Script {
         InstructionIndices::from_instructions(self.instructions_minimal())
     }
 
-    /// Shorthand for [`Self::verify_with_flags`] with flag [bitcoinconsensus::VERIFY_ALL].
-    ///
-    /// # Parameters
-    ///  * `index` - The input index in spending which is spending this transaction.
-    ///  * `amount` - The amount this script guards.
-    ///  * `spending_tx` - The transaction that attempts to spend the output holding this script.
-    #[cfg(feature = "bitcoinconsensus")]
-    pub fn verify(
-        &self,
-        index: usize,
-        amount: crate::Amount,
-        spending_tx: &[u8],
-    ) -> Result<(), Error> {
-        self.verify_with_flags(index, amount, spending_tx, bitcoinconsensus::VERIFY_ALL)
-    }
-
-    /// Verifies spend of an input script.
-    ///
-    /// # Parameters
-    ///  * `index` - The input index in spending which is spending this transaction.
-    ///  * `amount` - The amount this script guards.
-    ///  * `spending_tx` - The transaction that attempts to spend the output holding this script.
-    ///  * `flags` - Verification flags, see [`bitcoinconsensus::VERIFY_ALL`] and similar.
-    #[cfg(feature = "bitcoinconsensus")]
-    pub fn verify_with_flags<F: Into<u32>>(
-        &self,
-        index: usize,
-        amount: crate::Amount,
-        spending_tx: &[u8],
-        flags: F,
-    ) -> Result<(), Error> {
-        Ok(bitcoinconsensus::verify_with_flags(
-            &self.0[..],
-            amount.to_sat(),
-            spending_tx,
-            index,
-            flags.into(),
-        )?)
-    }
-
     /// Writes the assembly decoding of the script to the formatter.
     pub fn fmt_asm(&self, f: &mut dyn fmt::Write) -> fmt::Result {
         bytes_to_asm_fmt(self.as_ref(), f)
@@ -497,14 +475,14 @@ impl Script {
     pub fn to_hex_string(&self) -> String { self.as_bytes().to_lower_hex_string() }
 
     /// Returns the first opcode of the script (if there is any).
-    pub fn first_opcode(&self) -> Option<opcodes::All> {
+    pub fn first_opcode(&self) -> Option<Opcode> {
         self.as_bytes().first().copied().map(From::from)
     }
 
     /// Iterates the script to find the last opcode.
     ///
     /// Returns `None` is the instruction is data push or if the script is empty.
-    pub(in crate::blockdata::script) fn last_opcode(&self) -> Option<opcodes::All> {
+    pub(in crate::blockdata::script) fn last_opcode(&self) -> Option<Opcode> {
         match self.instructions().last() {
             Some(Ok(Instruction::Op(op))) => Some(op),
             _ => None,

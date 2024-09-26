@@ -9,73 +9,18 @@ use core::fmt::{self, Write};
 use core::ops;
 use core::str::FromStr;
 
-use hashes::hex::FromHex;
-use hashes::{hash160, hex, Hash};
+use hashes::{hash160, Hash};
+use hex::FromHex;
 use internals::write_err;
 #[cfg(feature = "rand-std")]
 pub use secp256k1::rand;
 pub use secp256k1::{self, constants, KeyPair, Parity, Secp256k1, Verification, XOnlyPublicKey};
 
-use crate::hash_types::{PubkeyHash, WPubkeyHash};
-use crate::network::constants::Network;
+use crate::crypto::ecdsa;
+use crate::network::Network;
 use crate::prelude::*;
 use crate::taproot::{TapNodeHash, TapTweakHash};
 use crate::{base58, io};
-
-/// A key-related error.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-#[non_exhaustive]
-pub enum Error {
-    /// Base58 encoding error
-    Base58(base58::Error),
-    /// secp256k1-related error
-    Secp256k1(secp256k1::Error),
-    /// Invalid key prefix error
-    InvalidKeyPrefix(u8),
-    /// Hex decoding error
-    Hex(hex::Error),
-    /// `PublicKey` hex should be 66 or 130 digits long.
-    InvalidHexLength(usize),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Error::Base58(ref e) => write_err!(f, "key base58 error"; e),
-            Error::Secp256k1(ref e) => write_err!(f, "key secp256k1 error"; e),
-            Error::InvalidKeyPrefix(ref b) => write!(f, "key prefix invalid: {}", b),
-            Error::Hex(ref e) => write_err!(f, "key hex decoding error"; e),
-            Error::InvalidHexLength(got) =>
-                write!(f, "PublicKey hex should be 66 or 130 digits long, got: {}", got),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use self::Error::*;
-
-        match self {
-            Base58(e) => Some(e),
-            Secp256k1(e) => Some(e),
-            Hex(e) => Some(e),
-            InvalidKeyPrefix(_) | InvalidHexLength(_) => None,
-        }
-    }
-}
-
-impl From<base58::Error> for Error {
-    fn from(e: base58::Error) -> Error { Error::Base58(e) }
-}
-
-impl From<secp256k1::Error> for Error {
-    fn from(e: secp256k1::Error) -> Error { Error::Secp256k1(e) }
-}
-
-impl From<hex::Error> for Error {
-    fn from(e: hex::Error) -> Self { Error::Hex(e) }
-}
 
 /// A Bitcoin ECDSA public key
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -251,6 +196,20 @@ impl PublicKey {
     ) -> PublicKey {
         sk.public_key(secp)
     }
+
+    /// Checks that `sig` is a valid ECDSA signature for `msg` using this public key.
+    pub fn verify<C: secp256k1::Verification>(
+        &self,
+        secp: &Secp256k1<C>,
+        msg: &secp256k1::Message,
+        sig: &ecdsa::Signature,
+    ) -> Result<(), Error> {
+        Ok(secp.verify_ecdsa(msg, &sig.sig, &self.inner)?)
+    }
+}
+
+impl From<secp256k1::PublicKey> for PublicKey {
+    fn from(pk: secp256k1::PublicKey) -> PublicKey { PublicKey::new(pk) }
 }
 
 impl From<PublicKey> for XOnlyPublicKey {
@@ -284,8 +243,20 @@ impl FromStr for PublicKey {
     }
 }
 
+hashes::hash_newtype! {
+    /// A hash of a public key.
+    pub struct PubkeyHash(hash160::Hash);
+    /// SegWit version of a public key hash.
+    pub struct WPubkeyHash(hash160::Hash);
+}
+crate::hash_types::impl_asref_push_bytes!(PubkeyHash, WPubkeyHash);
+
 impl From<PublicKey> for PubkeyHash {
     fn from(key: PublicKey) -> PubkeyHash { key.pubkey_hash() }
+}
+
+impl From<&PublicKey> for PubkeyHash {
+    fn from(key: &PublicKey) -> PubkeyHash { key.pubkey_hash() }
 }
 
 /// A Bitcoin ECDSA private key
@@ -715,18 +686,74 @@ impl From<TweakedKeyPair> for TweakedPublicKey {
     #[inline]
     fn from(pair: TweakedKeyPair) -> Self { TweakedPublicKey::from_keypair(pair) }
 }
+/// A key-related error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// A base58 error.
+    Base58(base58::Error),
+    /// A secp256k1 error.
+    Secp256k1(secp256k1::Error),
+    /// Invalid key prefix error.
+    InvalidKeyPrefix(u8),
+    /// Hex decoding error.
+    Hex(hex::HexToArrayError),
+    /// `PublicKey` hex should be 66 or 130 digits long.
+    InvalidHexLength(usize),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use Error::*;
+
+        match *self {
+            Base58(ref e) => write_err!(f, "base58"; e),
+            Secp256k1(ref e) => write_err!(f, "secp256k1"; e),
+            InvalidKeyPrefix(ref b) => write!(f, "key prefix invalid: {}", b),
+            Hex(ref e) => write_err!(f, "hex"; e),
+            InvalidHexLength(got) =>
+                write!(f, "pubkey hex should be 66 or 130 digits long, got: {}", got),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        use self::Error::*;
+
+        match self {
+            Base58(e) => Some(e),
+            Secp256k1(e) => Some(e),
+            Hex(e) => Some(e),
+            InvalidKeyPrefix(_) | InvalidHexLength(_) => None,
+        }
+    }
+}
+
+impl From<base58::Error> for Error {
+    fn from(e: base58::Error) -> Error { Error::Base58(e) }
+}
+
+impl From<secp256k1::Error> for Error {
+    fn from(e: secp256k1::Error) -> Error { Error::Secp256k1(e) }
+}
+
+impl From<hex::HexToArrayError> for Error {
+    fn from(e: hex::HexToArrayError) -> Self { Error::Hex(e) }
+}
 
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
-    use hashes::hex::FromHex;
+    use hex::FromHex;
     use secp256k1::Secp256k1;
 
     use super::*;
     use crate::address::Address;
     use crate::io;
-    use crate::network::constants::Network::{Bitcoin, Testnet};
+    use crate::network::Network::{Bitcoin, Testnet};
 
     #[test]
     fn test_key_derivation() {
